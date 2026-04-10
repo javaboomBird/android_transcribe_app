@@ -19,6 +19,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.text.TextUtils;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.LayoutInflater;
@@ -26,6 +27,8 @@ import android.view.View;
 import android.view.WindowManager;
 import android.widget.TextView;
 
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.List;
 
 public class LiveSubtitleService extends Service {
@@ -34,6 +37,7 @@ public class LiveSubtitleService extends Service {
     public static final String ACTION_STOP = "dev.notune.transcribe.STOP_SUBTITLES";
     private static final String CHANNEL_ID = "LiveSubtitlesChannel";
     private static final int NOTIFICATION_ID = 12345;
+    private static final int MAX_COMMITTED_LINES = 2;
 
     private MediaProjectionManager mProjectionManager;
     private MediaProjection mMediaProjection;
@@ -43,11 +47,30 @@ public class LiveSubtitleService extends Service {
 
     private WindowManager mWindowManager;
     private View mOverlayView;
-    private TextView mSubtitleText;
+    private TextView mOriginalText;
+    private TextView mTranslationText;
     private Handler mMainHandler;
 
     private SubtitleEngine mSubtitleEngine;
     private TranslationManager mTranslationManager;
+    private final Object mSubtitleLock = new Object();
+    private final ArrayDeque<SubtitleLine> mCommittedLines = new ArrayDeque<>();
+    private long mNextSegmentId = 1;
+    private long mPreviewRevision = 0;
+    private String mPreviewOriginal = "";
+    private String mPreviewTranslation = "";
+
+    private static class SubtitleLine {
+        final long id;
+        final String original;
+        String translated;
+
+        SubtitleLine(long id, String original) {
+            this.id = id;
+            this.original = original;
+            this.translated = original;
+        }
+    }
 
     @Override
     public void onCreate() {
@@ -102,22 +125,27 @@ public class LiveSubtitleService extends Service {
         }
 
         setupOverlay();
-        updateSubtitle("Loading models...");
+        updateStatus("Loading models...", "Preparing live translation...");
 
         new Thread(() -> {
             // Initialize ASR engine
             mSubtitleEngine = new SubtitleEngine();
-            mSubtitleEngine.init(this, status -> mMainHandler.post(() -> updateSubtitle(status)));
+            mSubtitleEngine.init(this, status -> mMainHandler.post(
+                    () -> updateStatus(status, "Preparing live translation...")));
 
             if (!mSubtitleEngine.isInitialized()) {
-                mMainHandler.post(() -> updateSubtitle("Error: ASR model failed to load"));
+                mMainHandler.post(() -> updateStatus(
+                        "Error: ASR model failed to load",
+                        "Check model assets and restart"));
                 return;
             }
 
             // Initialize translation and pre-download model for configured language
             mTranslationManager = new TranslationManager();
             String sourceLang = mSubtitleEngine.getSourceLanguage();
-            mMainHandler.post(() -> updateSubtitle("Downloading translation model..."));
+            mMainHandler.post(() -> updateStatus(
+                    "Loading ASR complete",
+                    "Downloading translation model..."));
             boolean downloaded = mTranslationManager.downloadModelSync(sourceLang, 60000);
 
             if (downloaded) {
@@ -127,7 +155,7 @@ public class LiveSubtitleService extends Service {
             }
 
             mMainHandler.post(() -> {
-                updateSubtitle("Waiting for audio...");
+                updateStatus("Waiting for audio...", "Translation will appear here");
                 startAudioCapture();
             });
         }).start();
@@ -170,8 +198,9 @@ public class LiveSubtitleService extends Service {
         LayoutInflater inflater = LayoutInflater.from(this);
         mOverlayView = inflater.inflate(R.layout.service_subtitle, null);
 
-        mSubtitleText = mOverlayView.findViewById(R.id.subs_text);
-        mSubtitleText.setText("Waiting for audio...");
+        mOriginalText = mOverlayView.findViewById(R.id.subs_original_text);
+        mTranslationText = mOverlayView.findViewById(R.id.subs_translation_text);
+        updateStatus("Waiting for audio...", "Translation will appear here");
 
         View closeBtn = mOverlayView.findViewById(R.id.btn_close_subs);
         closeBtn.setOnClickListener(v -> {
@@ -266,11 +295,8 @@ public class LiveSubtitleService extends Service {
                 }
 
                 float[] samples = (read == bufferSize) ? floatBuffer : java.util.Arrays.copyOf(floatBuffer, read);
-                List<SubtitleEngine.AsrResult> results = mSubtitleEngine.processAudio(samples);
-
-                for (SubtitleEngine.AsrResult asr : results) {
-                    translateAndShow(asr.text, asr.lang);
-                }
+                SubtitleEngine.SubtitleUpdate update = mSubtitleEngine.processAudio(samples);
+                handleEngineUpdate(update);
             } else if (read == AudioRecord.ERROR_DEAD_OBJECT) {
                 Log.e(TAG, "Audio read error: DEAD_OBJECT");
                 isRecording = false;
@@ -279,35 +305,165 @@ public class LiveSubtitleService extends Service {
 
         if (mSubtitleEngine != null && mSubtitleEngine.isInitialized()) {
             List<SubtitleEngine.AsrResult> remaining = mSubtitleEngine.flush();
+            clearPreviewLine();
             for (SubtitleEngine.AsrResult asr : remaining) {
-                translateAndShow(asr.text, asr.lang);
+                handleCommittedResult(asr);
             }
         }
         Log.d(TAG, "Audio loop finished");
     }
 
-    private void translateAndShow(String text, String lang) {
-        if (mTranslationManager != null && mTranslationManager.isModelReady(lang)) {
-            mTranslationManager.translate(text, lang, new TranslationManager.TranslateCallback() {
-                @Override
-                public void onResult(String translated) {
-                    mMainHandler.post(() -> updateSubtitle(translated));
-                }
-
-                @Override
-                public void onError(String error) {
-                    Log.w(TAG, "Translation error: " + error);
-                    mMainHandler.post(() -> updateSubtitle(text));
-                }
-            });
-        } else {
-            mMainHandler.post(() -> updateSubtitle(text));
+    private void handleEngineUpdate(SubtitleEngine.SubtitleUpdate update) {
+        if (update == null) {
+            return;
+        }
+        if (update.previewResult != null) {
+            handlePreviewResult(update.previewResult);
+        }
+        for (SubtitleEngine.AsrResult asr : update.committedResults) {
+            handleCommittedResult(asr);
         }
     }
 
-    private void updateSubtitle(String text) {
-        if (mSubtitleText != null) {
-            mSubtitleText.setText(text);
+    private void handleCommittedResult(SubtitleEngine.AsrResult asr) {
+        SubtitleLine line;
+        synchronized (mSubtitleLock) {
+            line = new SubtitleLine(mNextSegmentId++, asr.text);
+            mCommittedLines.addLast(line);
+            while (mCommittedLines.size() > MAX_COMMITTED_LINES) {
+                mCommittedLines.removeFirst();
+            }
+        }
+        renderSubtitleState();
+        requestCommittedTranslation(line.id, asr.text, asr.lang);
+    }
+
+    private void handlePreviewResult(SubtitleEngine.PreviewResult preview) {
+        if (preview.text == null || preview.text.trim().isEmpty()) {
+            clearPreviewLine();
+            return;
+        }
+
+        long revision;
+        synchronized (mSubtitleLock) {
+            if (preview.text.equals(mPreviewOriginal)) {
+                return;
+            }
+            mPreviewOriginal = preview.text;
+            mPreviewTranslation = isChinese(preview.lang) ? preview.text : "";
+            revision = ++mPreviewRevision;
+        }
+        renderSubtitleState();
+        requestPreviewTranslation(revision, preview.text, preview.lang);
+    }
+
+    private void clearPreviewLine() {
+        synchronized (mSubtitleLock) {
+            mPreviewOriginal = "";
+            mPreviewTranslation = "";
+            mPreviewRevision++;
+        }
+        renderSubtitleState();
+    }
+
+    private void requestCommittedTranslation(long lineId, String text, String lang) {
+        if (mTranslationManager == null) {
+            return;
+        }
+        mTranslationManager.translateWhenReady(text, lang, new TranslationManager.TranslateCallback() {
+            @Override
+            public void onResult(String translatedText) {
+                synchronized (mSubtitleLock) {
+                    for (SubtitleLine line : mCommittedLines) {
+                        if (line.id == lineId) {
+                            line.translated = translatedText;
+                            break;
+                        }
+                    }
+                }
+                renderSubtitleState();
+            }
+
+            @Override
+            public void onError(String error) {
+                Log.w(TAG, "Committed translation error: " + error);
+            }
+        });
+    }
+
+    private void requestPreviewTranslation(long revision, String text, String lang) {
+        if (mTranslationManager == null || isChinese(lang)) {
+            return;
+        }
+
+        mTranslationManager.translateWhenReady(text, lang, new TranslationManager.TranslateCallback() {
+            @Override
+            public void onResult(String translatedText) {
+                synchronized (mSubtitleLock) {
+                    if (revision != mPreviewRevision || !text.equals(mPreviewOriginal)) {
+                        return;
+                    }
+                    mPreviewTranslation = translatedText;
+                }
+                renderSubtitleState();
+            }
+
+            @Override
+            public void onError(String error) {
+                Log.w(TAG, "Preview translation error: " + error);
+            }
+        });
+    }
+
+    private void renderSubtitleState() {
+        final String originalText;
+        final String translationText;
+        synchronized (mSubtitleLock) {
+            originalText = buildDisplayText(false);
+            translationText = buildDisplayText(true);
+        }
+
+        mMainHandler.post(() -> {
+            if (mOriginalText != null) {
+                mOriginalText.setText(originalText.isEmpty() ? "Waiting for audio..." : originalText);
+            }
+            if (mTranslationText != null) {
+                mTranslationText.setText(translationText.isEmpty() ? "Translation will appear here" : translationText);
+            }
+        });
+    }
+
+    private String buildDisplayText(boolean translated) {
+        List<String> lines = new ArrayList<>();
+        for (SubtitleLine line : mCommittedLines) {
+            lines.add(translated ? line.translated : line.original);
+        }
+
+        if (!mPreviewOriginal.isEmpty()) {
+            if (translated) {
+                lines.add(mPreviewTranslation.isEmpty() ? "..." : mPreviewTranslation);
+            } else {
+                lines.add(mPreviewOriginal);
+            }
+        }
+
+        return TextUtils.join("\n", lines);
+    }
+
+    private boolean isChinese(String lang) {
+        if (lang == null) {
+            return false;
+        }
+        String normalized = lang.replace("<|", "").replace("|>", "").trim();
+        return "zh".equals(normalized) || "yue".equals(normalized);
+    }
+
+    private void updateStatus(String originalText, String translationText) {
+        if (mOriginalText != null) {
+            mOriginalText.setText(originalText);
+        }
+        if (mTranslationText != null) {
+            mTranslationText.setText(translationText);
         }
     }
 

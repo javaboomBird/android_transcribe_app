@@ -13,18 +13,41 @@
         android:padding="12dp"
         android:gravity="center_vertical">
 
-        <TextView
-            android:id="@+id/subs_text"
+        <LinearLayout
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="..."
-            android:textColor="#FFFFFF"
-            android:textSize="18sp"
-            android:shadowColor="#000000"
-            android:shadowDx="1"
-            android:shadowDy="1"
-            android:shadowRadius="2"/>
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/subs_original_text"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Waiting for audio..."
+                android:textColor="#FFFFFF"
+                android:textSize="18sp"
+                android:textStyle="bold"
+                android:maxLines="3"
+                android:shadowColor="#000000"
+                android:shadowDx="1"
+                android:shadowDy="1"
+                android:shadowRadius="2" />
+
+            <TextView
+                android:id="@+id/subs_translation_text"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="Translation will appear here"
+                android:textColor="#D6F5D6"
+                android:textSize="16sp"
+                android:maxLines="3"
+                android:shadowColor="#000000"
+                android:shadowDx="1"
+                android:shadowDy="1"
+                android:shadowRadius="2" />
+
+        </LinearLayout>
 
         <ImageButton
             android:id="@+id/btn_close_subs"

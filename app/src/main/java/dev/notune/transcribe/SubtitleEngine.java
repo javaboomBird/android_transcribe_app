@@ -17,6 +17,7 @@ import com.k2fsa.sherpa.onnx.TenVadModelConfig;
 import com.k2fsa.sherpa.onnx.Vad;
 import com.k2fsa.sherpa.onnx.VadModelConfig;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -28,11 +29,19 @@ import java.util.List;
 public class SubtitleEngine {
     private static final String TAG = "SubtitleEngine";
     private static final int SAMPLE_RATE = 16000;
+    private static final int PREVIEW_MIN_SAMPLES = SAMPLE_RATE / 2;
+    private static final int PREVIEW_UPDATE_INTERVAL_SAMPLES = SAMPLE_RATE / 2;
+    private static final int PREVIEW_MAX_SAMPLES = SAMPLE_RATE * 8;
 
     private OfflineRecognizer recognizer;
     private Vad vad;
     private boolean initialized = false;
     private String sourceLanguage = "ja";
+    private final ArrayDeque<float[]> previewChunks = new ArrayDeque<>();
+    private int previewSampleCount = 0;
+    private int previewSamplesSinceLastDecode = 0;
+    private String lastPreviewText = "";
+    private String lastPreviewLang = "";
 
     public interface StatusCallback {
         void onStatus(String status);
@@ -48,6 +57,32 @@ public class SubtitleEngine {
         public AsrResult(String text, String lang) {
             this.text = text;
             this.lang = lang;
+        }
+    }
+
+    /**
+     * Preview text for the currently active speech segment.
+     */
+    public static class PreviewResult {
+        public final String text;
+        public final String lang;
+
+        public PreviewResult(String text, String lang) {
+            this.text = text;
+            this.lang = lang;
+        }
+    }
+
+    /**
+     * Combined engine update: newly committed segments plus optional preview text.
+     */
+    public static class SubtitleUpdate {
+        public final List<AsrResult> committedResults;
+        public final PreviewResult previewResult;
+
+        public SubtitleUpdate(List<AsrResult> committedResults, PreviewResult previewResult) {
+            this.committedResults = committedResults;
+            this.previewResult = previewResult;
         }
     }
 
@@ -126,37 +161,35 @@ public class SubtitleEngine {
      * Feed audio samples to VAD. If speech segments are detected,
      * run ASR and return recognized text results with detected language.
      */
-    public List<AsrResult> processAudio(float[] samples) {
+    public SubtitleUpdate processAudio(float[] samples) {
         List<AsrResult> results = new ArrayList<>();
-        if (!initialized) return results;
+        if (!initialized) return new SubtitleUpdate(results, null);
 
         vad.acceptWaveform(samples);
+        if (vad.isSpeechDetected()) {
+            appendPreviewSamples(samples);
+            previewSamplesSinceLastDecode += samples.length;
+        }
 
         while (!vad.empty()) {
             SpeechSegment segment = vad.front();
-            float[] segmentSamples = segment.getSamples();
-
-            if (segmentSamples.length > 0) {
-                long t0 = System.currentTimeMillis();
-                OfflineStream stream = recognizer.createStream();
-                stream.acceptWaveform(segmentSamples, SAMPLE_RATE);
-                recognizer.decode(stream);
-
-                OfflineRecognizerResult result = recognizer.getResult(stream);
-                long elapsed = System.currentTimeMillis() - t0;
-                String text = result.getText().trim();
-                String lang = result.getLang();
-                float durationSec = segmentSamples.length / (float) SAMPLE_RATE;
-                Log.i(TAG, "ASR: lang=" + lang + " duration=" + String.format("%.1f", durationSec) + "s inference=" + elapsed + "ms text=\"" + text + "\"");
-                if (!text.isEmpty()) {
-                    results.add(new AsrResult(text, lang != null ? lang : ""));
-                }
-                stream.release();
+            AsrResult result = decodeSamples(segment.getSamples(), "ASR");
+            if (result != null) {
+                results.add(result);
             }
             vad.pop();
         }
 
-        return results;
+        PreviewResult previewResult = null;
+        if (!results.isEmpty()) {
+            previewResult = clearPreviewIfNeeded();
+        } else if (previewSampleCount >= PREVIEW_MIN_SAMPLES
+                && previewSamplesSinceLastDecode >= PREVIEW_UPDATE_INTERVAL_SAMPLES) {
+            previewResult = decodePreview();
+            previewSamplesSinceLastDecode = 0;
+        }
+
+        return new SubtitleUpdate(results, previewResult);
     }
 
     /**
@@ -169,31 +202,19 @@ public class SubtitleEngine {
         vad.flush();
         while (!vad.empty()) {
             SpeechSegment segment = vad.front();
-            float[] segmentSamples = segment.getSamples();
-
-            if (segmentSamples.length > 0) {
-                long t0 = System.currentTimeMillis();
-                OfflineStream stream = recognizer.createStream();
-                stream.acceptWaveform(segmentSamples, SAMPLE_RATE);
-                recognizer.decode(stream);
-
-                OfflineRecognizerResult result = recognizer.getResult(stream);
-                long elapsed = System.currentTimeMillis() - t0;
-                String text = result.getText().trim();
-                String lang = result.getLang();
-                Log.i(TAG, "ASR(flush): lang=" + lang + " inference=" + elapsed + "ms text=\"" + text + "\"");
-                if (!text.isEmpty()) {
-                    results.add(new AsrResult(text, lang != null ? lang : ""));
-                }
-                stream.release();
+            AsrResult result = decodeSamples(segment.getSamples(), "ASR(flush)");
+            if (result != null) {
+                results.add(result);
             }
             vad.pop();
         }
 
+        clearPreviewState();
         return results;
     }
 
     public void release() {
+        clearPreviewState();
         if (recognizer != null) {
             recognizer.release();
             recognizer = null;
@@ -203,6 +224,86 @@ public class SubtitleEngine {
             vad = null;
         }
         initialized = false;
+    }
+
+    private AsrResult decodeSamples(float[] segmentSamples, String label) {
+        if (segmentSamples == null || segmentSamples.length == 0) {
+            return null;
+        }
+
+        long t0 = System.currentTimeMillis();
+        OfflineStream stream = recognizer.createStream();
+        try {
+            stream.acceptWaveform(segmentSamples, SAMPLE_RATE);
+            recognizer.decode(stream);
+
+            OfflineRecognizerResult result = recognizer.getResult(stream);
+            long elapsed = System.currentTimeMillis() - t0;
+            String text = result.getText().trim();
+            String lang = result.getLang();
+            float durationSec = segmentSamples.length / (float) SAMPLE_RATE;
+            Log.i(TAG, label + ": lang=" + lang
+                    + " duration=" + String.format("%.1f", durationSec)
+                    + "s inference=" + elapsed + "ms text=\"" + text + "\"");
+            if (text.isEmpty()) {
+                return null;
+            }
+            return new AsrResult(text, lang != null ? lang : "");
+        } finally {
+            stream.release();
+        }
+    }
+
+    private void appendPreviewSamples(float[] samples) {
+        float[] copy = new float[samples.length];
+        System.arraycopy(samples, 0, copy, 0, samples.length);
+        previewChunks.addLast(copy);
+        previewSampleCount += copy.length;
+
+        while (previewSampleCount > PREVIEW_MAX_SAMPLES && !previewChunks.isEmpty()) {
+            float[] dropped = previewChunks.removeFirst();
+            previewSampleCount -= dropped.length;
+        }
+    }
+
+    private PreviewResult decodePreview() {
+        float[] previewSamples = buildPreviewSamples();
+        AsrResult preview = decodeSamples(previewSamples, "ASR(preview)");
+        if (preview == null) {
+            return null;
+        }
+
+        if (preview.text.equals(lastPreviewText) && preview.lang.equals(lastPreviewLang)) {
+            return null;
+        }
+
+        lastPreviewText = preview.text;
+        lastPreviewLang = preview.lang;
+        return new PreviewResult(preview.text, preview.lang);
+    }
+
+    private float[] buildPreviewSamples() {
+        float[] allSamples = new float[previewSampleCount];
+        int offset = 0;
+        for (float[] chunk : previewChunks) {
+            System.arraycopy(chunk, 0, allSamples, offset, chunk.length);
+            offset += chunk.length;
+        }
+        return allSamples;
+    }
+
+    private PreviewResult clearPreviewIfNeeded() {
+        boolean hadPreview = !lastPreviewText.isEmpty();
+        clearPreviewState();
+        return hadPreview ? new PreviewResult("", "") : null;
+    }
+
+    private void clearPreviewState() {
+        previewChunks.clear();
+        previewSampleCount = 0;
+        previewSamplesSinceLastDecode = 0;
+        lastPreviewText = "";
+        lastPreviewLang = "";
     }
 
 }
