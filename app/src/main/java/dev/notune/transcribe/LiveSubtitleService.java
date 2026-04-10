@@ -24,9 +24,9 @@ import android.view.Gravity;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.WindowManager;
-import android.widget.Button;
 import android.widget.TextView;
-import android.widget.LinearLayout;
+
+import java.util.List;
 
 public class LiveSubtitleService extends Service {
     private static final String TAG = "LiveSubtitleService";
@@ -35,26 +35,19 @@ public class LiveSubtitleService extends Service {
     private static final String CHANNEL_ID = "LiveSubtitlesChannel";
     private static final int NOTIFICATION_ID = 12345;
 
-    static {
-        try {
-            System.loadLibrary("c++_shared");
-            System.loadLibrary("onnxruntime");
-            System.loadLibrary("android_transcribe_app");
-        } catch (UnsatisfiedLinkError e) {
-            Log.e(TAG, "Failed to load native libraries", e);
-        }
-    }
-
     private MediaProjectionManager mProjectionManager;
     private MediaProjection mMediaProjection;
     private AudioRecord mAudioRecord;
     private Thread mAudioThread;
-    private boolean isRecording = false;
+    private volatile boolean isRecording = false;
 
     private WindowManager mWindowManager;
     private View mOverlayView;
     private TextView mSubtitleText;
     private Handler mMainHandler;
+
+    private SubtitleEngine mSubtitleEngine;
+    private TranslationManager mTranslationManager;
 
     @Override
     public void onCreate() {
@@ -84,13 +77,11 @@ public class LiveSubtitleService extends Service {
 
             int code = intent.getIntExtra("code", 0);
             Intent data = intent.getParcelableExtra("data");
-            
-            Log.d(TAG, "Received start command. Code: " + code + ", Data: " + data);
-            
+
             if (code != 0 && data != null) {
                 startSubtitleSession(code, data);
             } else {
-                Log.e(TAG, "Missing or invalid extras for media projection. Code: " + code + ", Data: " + data);
+                Log.e(TAG, "Missing or invalid extras for media projection");
                 stopSelf();
             }
         } else if (ACTION_STOP.equals(intent.getAction())) {
@@ -110,23 +101,52 @@ public class LiveSubtitleService extends Service {
             return;
         }
 
-        initNative(this);
         setupOverlay();
-        startAudioCapture();
+        updateSubtitle("Loading models...");
+
+        new Thread(() -> {
+            // Initialize ASR engine
+            mSubtitleEngine = new SubtitleEngine();
+            mSubtitleEngine.init(this, status -> mMainHandler.post(() -> updateSubtitle(status)));
+
+            if (!mSubtitleEngine.isInitialized()) {
+                mMainHandler.post(() -> updateSubtitle("Error: ASR model failed to load"));
+                return;
+            }
+
+            // Initialize translation and pre-download model for configured language
+            mTranslationManager = new TranslationManager();
+            String sourceLang = mSubtitleEngine.getSourceLanguage();
+            mMainHandler.post(() -> updateSubtitle("Downloading translation model..."));
+            boolean downloaded = mTranslationManager.downloadModelSync(sourceLang, 60000);
+
+            if (downloaded) {
+                Log.i(TAG, "Translation model ready for: " + sourceLang);
+            } else {
+                Log.w(TAG, "Translation model download failed, will show original text");
+            }
+
+            mMainHandler.post(() -> {
+                updateSubtitle("Waiting for audio...");
+                startAudioCapture();
+            });
+        }).start();
     }
 
     private void stopSubtitleSession() {
         isRecording = false;
         if (mAudioThread != null) {
             try {
-                mAudioThread.join();
+                mAudioThread.join(3000);
             } catch (InterruptedException e) {
                 e.printStackTrace();
             }
             mAudioThread = null;
         }
         if (mAudioRecord != null) {
-            mAudioRecord.stop();
+            try {
+                mAudioRecord.stop();
+            } catch (Exception ignored) {}
             mAudioRecord.release();
             mAudioRecord = null;
         }
@@ -134,45 +154,47 @@ public class LiveSubtitleService extends Service {
             mMediaProjection.stop();
             mMediaProjection = null;
         }
+        if (mSubtitleEngine != null) {
+            mSubtitleEngine.release();
+            mSubtitleEngine = null;
+        }
+        if (mTranslationManager != null) {
+            mTranslationManager.release();
+            mTranslationManager = null;
+        }
         removeOverlay();
-        cleanupNative();
     }
 
     private void setupOverlay() {
         mWindowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
-        
         LayoutInflater inflater = LayoutInflater.from(this);
         mOverlayView = inflater.inflate(R.layout.service_subtitle, null);
-        
+
         mSubtitleText = mOverlayView.findViewById(R.id.subs_text);
         mSubtitleText.setText("Waiting for audio...");
-        
+
         View closeBtn = mOverlayView.findViewById(R.id.btn_close_subs);
         closeBtn.setOnClickListener(v -> {
             Intent stopIntent = new Intent(this, LiveSubtitleService.class);
             stopIntent.setAction(ACTION_STOP);
             startService(stopIntent);
         });
-        
-        int layoutFlag;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            layoutFlag = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
-        } else {
-            layoutFlag = WindowManager.LayoutParams.TYPE_PHONE;
-        }
+
+        int layoutFlag = (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                : WindowManager.LayoutParams.TYPE_PHONE;
 
         WindowManager.LayoutParams params = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 layoutFlag,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | 
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
                 WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
                 PixelFormat.TRANSLUCENT);
 
         params.gravity = Gravity.BOTTOM;
-        params.y = 100; // Margin bottom
-
+        params.y = 100;
         mWindowManager.addView(mOverlayView, params);
     }
 
@@ -184,9 +206,8 @@ public class LiveSubtitleService extends Service {
     }
 
     private void startAudioCapture() {
-        Log.d(TAG, "Starting audio capture. MediaProjection: " + mMediaProjection);
         if (mMediaProjection == null) {
-            Log.e(TAG, "MediaProjection is null, cannot capture audio");
+            Log.e(TAG, "MediaProjection is null");
             return;
         }
 
@@ -197,22 +218,18 @@ public class LiveSubtitleService extends Service {
                 .build();
 
         int sampleRate = 16000;
-        int channelConfig = AudioFormat.CHANNEL_IN_MONO;
-        int audioFormat = AudioFormat.ENCODING_PCM_16BIT;
-
-        int minBufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat);
-        int bufferSize = Math.max(minBufferSize, 16000); // 1 second buffer roughly
+        int minBufferSize = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
 
         AudioFormat format = new AudioFormat.Builder()
-                .setEncoding(audioFormat)
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                 .setSampleRate(sampleRate)
-                .setChannelMask(channelConfig)
+                .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
                 .build();
 
         try {
             mAudioRecord = new AudioRecord.Builder()
                     .setAudioFormat(format)
-                    .setBufferSizeInBytes(bufferSize)
+                    .setBufferSizeInBytes(Math.max(minBufferSize, 16000))
                     .setAudioPlaybackCaptureConfig(config)
                     .build();
 
@@ -223,18 +240,12 @@ public class LiveSubtitleService extends Service {
             }
 
             mAudioRecord.startRecording();
-            if (mAudioRecord.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) {
-                Log.e(TAG, "AudioRecord failed to start recording. State: " + mAudioRecord.getRecordingState());
-                stopSubtitleSession();
-                return;
-            }
-            
             isRecording = true;
             Log.d(TAG, "AudioRecord started successfully");
-            
+
             mAudioThread = new Thread(this::audioLoop);
             mAudioThread.start();
-            
+
         } catch (Exception e) {
             Log.e(TAG, "Error starting AudioRecord", e);
             stopSubtitleSession();
@@ -243,71 +254,80 @@ public class LiveSubtitleService extends Service {
 
     private void audioLoop() {
         Log.d(TAG, "Starting audio loop");
-        int bufferSize = 1024; // Process in small chunks
+        int bufferSize = 512;
         short[] buffer = new short[bufferSize];
         float[] floatBuffer = new float[bufferSize];
-        int totalRead = 0;
 
         while (isRecording) {
             int read = mAudioRecord.read(buffer, 0, bufferSize);
             if (read > 0) {
-                totalRead += read;
-                if (totalRead % (16000 * 5) < read) { // Log approx every 5 seconds of audio
-                    Log.d(TAG, "Reading audio... Total samples: " + totalRead);
-                }
-                
-                // Convert short to float
                 for (int i = 0; i < read; i++) {
                     floatBuffer[i] = buffer[i] / 32768.0f;
                 }
-                pushAudio(floatBuffer, read);
-            } else {
-                if (read == AudioRecord.ERROR_INVALID_OPERATION) {
-                    Log.e(TAG, "Audio read error: INVALID_OPERATION");
-                } else if (read == AudioRecord.ERROR_BAD_VALUE) {
-                    Log.e(TAG, "Audio read error: BAD_VALUE");
-                } else if (read == AudioRecord.ERROR_DEAD_OBJECT) {
-                    Log.e(TAG, "Audio read error: DEAD_OBJECT");
-                    isRecording = false;
-                } else if (read == 0) {
-                     // Sometimes happens if no audio is playing?
-                } else {
-                     Log.e(TAG, "Audio read error: " + read);
+
+                float[] samples = (read == bufferSize) ? floatBuffer : java.util.Arrays.copyOf(floatBuffer, read);
+                List<SubtitleEngine.AsrResult> results = mSubtitleEngine.processAudio(samples);
+
+                for (SubtitleEngine.AsrResult asr : results) {
+                    translateAndShow(asr.text, asr.lang);
                 }
+            } else if (read == AudioRecord.ERROR_DEAD_OBJECT) {
+                Log.e(TAG, "Audio read error: DEAD_OBJECT");
+                isRecording = false;
+            }
+        }
+
+        if (mSubtitleEngine != null && mSubtitleEngine.isInitialized()) {
+            List<SubtitleEngine.AsrResult> remaining = mSubtitleEngine.flush();
+            for (SubtitleEngine.AsrResult asr : remaining) {
+                translateAndShow(asr.text, asr.lang);
             }
         }
         Log.d(TAG, "Audio loop finished");
     }
 
-    // Called from Rust
-    public void onSubtitleText(String text) {
-        mMainHandler.post(() -> {
-            if (mSubtitleText != null) {
-                mSubtitleText.setText(text);
-            }
-        });
+    private void translateAndShow(String text, String lang) {
+        if (mTranslationManager != null && mTranslationManager.isModelReady(lang)) {
+            mTranslationManager.translate(text, lang, new TranslationManager.TranslateCallback() {
+                @Override
+                public void onResult(String translated) {
+                    mMainHandler.post(() -> updateSubtitle(translated));
+                }
+
+                @Override
+                public void onError(String error) {
+                    Log.w(TAG, "Translation error: " + error);
+                    mMainHandler.post(() -> updateSubtitle(text));
+                }
+            });
+        } else {
+            mMainHandler.post(() -> updateSubtitle(text));
+        }
+    }
+
+    private void updateSubtitle(String text) {
+        if (mSubtitleText != null) {
+            mSubtitleText.setText(text);
+        }
     }
 
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "Live Subtitles", NotificationManager.IMPORTANCE_LOW);
             NotificationManager manager = getSystemService(NotificationManager.class);
-            if (manager != null) {
-                manager.createNotificationChannel(channel);
-            }
+            if (manager != null) manager.createNotificationChannel(channel);
         }
     }
 
     private Notification createNotification() {
         createNotificationChannel();
-
         Intent stopIntent = new Intent(this, LiveSubtitleService.class);
         stopIntent.setAction(ACTION_STOP);
         PendingIntent stopPendingIntent = PendingIntent.getService(this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE);
 
         return new Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle("Live Subtitles Active")
-                .setContentText("Recording internal audio...")
+                .setContentText("Recognizing & translating audio...")
                 .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                 .addAction(new Notification.Action.Builder(null, "Stop", stopPendingIntent).build())
                 .build();
@@ -317,10 +337,4 @@ public class LiveSubtitleService extends Service {
     public IBinder onBind(Intent intent) {
         return null;
     }
-
-    // Native methods
-    private native void initNative(LiveSubtitleService service);
-    private native void cleanupNative();
-    private native void pushAudio(float[] data, int length);
-    private native void setUpdateInterval(float seconds);
 }

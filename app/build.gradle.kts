@@ -55,6 +55,7 @@ android {
         jniLibs {
             useLegacyPackaging = false          // extractNativeLibs=false (16KB safe)
             keepDebugSymbols += "**/*.so"
+            pickFirsts += "lib/*/libonnxruntime.so"
         }
     }
 
@@ -81,6 +82,9 @@ if (!isBundle) {
 
 dependencies {
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.22.0")
+    implementation(files("libs/sherpa-onnx-static-link-onnxruntime-1.12.36.aar"))
+    implementation("org.jetbrains.kotlin:kotlin-stdlib:1.9.24")
+    implementation("com.google.mlkit:translate:17.0.3")
 }
 
 // Dedicated configuration to resolve the ORT AAR for the Rust build
@@ -139,7 +143,9 @@ val cargoNdkBuild by tasks.registering(Exec::class) {
     // Copy libc++_shared.so from NDK (needed because Rust links against it dynamically)
     doLast {
         val ndkPath = environment["ANDROID_NDK_HOME"] as String
-        val libcpp = file("$ndkPath/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so")
+        val prebuiltDir = File("$ndkPath/toolchains/llvm/prebuilt")
+        val hostDir = prebuiltDir.listFiles()?.firstOrNull { it.isDirectory } ?: throw GradleException("No prebuilt host dir found in $prebuiltDir")
+        val libcpp = File(hostDir, "sysroot/usr/lib/aarch64-linux-android/libc++_shared.so")
         if (libcpp.exists()) {
             val destDir = File(jniLibsDir, "arm64-v8a")
             destDir.mkdirs()
@@ -260,4 +266,70 @@ val downloadModels by tasks.registering {
 
 tasks.named("preBuild") {
     dependsOn(downloadModels)
+    dependsOn(downloadSenseVoiceModels)
+}
+
+// ---------------------------------------------------------------------------
+// SenseVoice + Silero VAD model download (for live subtitle ASR)
+// ---------------------------------------------------------------------------
+
+val senseVoiceFiles = listOf(
+    ModelFile("model.int8.onnx",
+        ""),  // checksum omitted — large file, verify manually if needed
+)
+
+val senseVoiceRepo = "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main"
+
+val sileroVadFiles = listOf(
+    ModelFile("silero_vad.onnx", ""),
+)
+
+val sileroVadRepo = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models"
+
+val downloadSenseVoiceModels by tasks.registering {
+    description = "Download SenseVoice ASR and Silero VAD models for live subtitle"
+    group = "build"
+
+    val senseVoiceDir = rootProject.file("model_assets/src/main/assets/sense-voice")
+    val vadDir = rootProject.file("model_assets/src/main/assets/silero-vad")
+    outputs.dir(senseVoiceDir)
+    outputs.dir(vadDir)
+
+    doLast {
+        // SenseVoice model + tokens
+        senseVoiceDir.mkdirs()
+        senseVoiceFiles.forEach { model ->
+            val destFile = File(senseVoiceDir, model.name)
+            if (!destFile.exists()) {
+                println("  ↓ Downloading SenseVoice ${model.name}...")
+                val proc = ProcessBuilder("curl", "-L", "-f", "-o", destFile.absolutePath,
+                    "$senseVoiceRepo/${model.name}?download=true")
+                    .inheritIO().start()
+                if (proc.waitFor() != 0) throw GradleException("Failed to download ${model.name}")
+                println("  ✓ ${model.name} downloaded")
+            } else {
+                println("  ✓ SenseVoice ${model.name} already exists")
+            }
+        }
+        // tokens.txt
+        val tokensFile = File(senseVoiceDir, "tokens.txt")
+        if (!tokensFile.exists()) {
+            println("  ↓ Downloading SenseVoice tokens.txt...")
+            val proc = ProcessBuilder("curl", "-L", "-f", "-o", tokensFile.absolutePath,
+                "$senseVoiceRepo/tokens.txt?download=true")
+                .inheritIO().start()
+            if (proc.waitFor() != 0) throw GradleException("Failed to download tokens.txt")
+        }
+
+        // Silero VAD model
+        vadDir.mkdirs()
+        val vadFile = File(vadDir, "silero_vad.onnx")
+        if (!vadFile.exists()) {
+            println("  ↓ Downloading Silero VAD model...")
+            val proc = ProcessBuilder("curl", "-L", "-f", "-o", vadFile.absolutePath,
+                "$sileroVadRepo/silero_vad.onnx")
+                .inheritIO().start()
+            if (proc.waitFor() != 0) throw GradleException("Failed to download silero_vad.onnx")
+        }
+    }
 }

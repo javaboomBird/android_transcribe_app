@@ -58,6 +58,9 @@ public class MainActivity extends Activity {
             startActivity(intent);
         });
 
+        // Subtitle feature uses sherpa-onnx (loaded independently), enable button immediately
+        startSubsButton.setEnabled(true);
+
         Switch autoRecordSwitch = findViewById(R.id.switch_auto_record);
         File autoRecordFile = new File(getFilesDir(), "auto_record");
         autoRecordSwitch.setChecked(autoRecordFile.exists());
